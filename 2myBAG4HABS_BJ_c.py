@@ -467,3 +467,57 @@ pred_df.to_csv(os.path.join(OUTDIR_RES, "cv_predictions.csv"), index=False)
 print("\n=== Cross-Validation Summary ===")
 print(metrics_df)
 print("\nSaved to:", OUTDIR_RES)
+
+
+
+###save final model trained on all healthy ###
+
+# ===== Train final model on ALL healthy graphs and save a checkpoint =====
+from torch_geometric.loader import DataLoader
+import json
+
+final_model = BrainAgeGAT().to(device)
+final_opt   = torch.optim.Adam(final_model.parameters(), lr=1e-3, weight_decay=1e-4)
+final_loss  = nn.MSELoss()
+
+loader_all = DataLoader(graphs, batch_size=16, shuffle=True)
+
+EPOCHS_ALL = 100
+for epoch in range(EPOCHS_ALL):
+    final_model.train()
+    for batch in loader_all:
+        batch = batch.to(device)
+        final_opt.zero_grad()
+        pred = final_model(batch)          # [B]
+        loss = final_loss(pred, batch.y)   # batch.y is [B]
+        loss.backward()
+        final_opt.step()
+
+# Save the trained-on-all model checkpoint
+ckpt_path = os.path.join(OUTDIR_RES, "model_trained_on_all_healthy.pt")
+torch.save(final_model.state_dict(), ckpt_path)
+print(f"[OK] Saved final model: {ckpt_path}")
+
+# (Optional) Fit & save bias-correction params on ALL healthy after training
+final_model.eval()
+with torch.no_grad():
+    yhat_all, age_all = [], []
+    for batch in DataLoader(graphs, batch_size=64, shuffle=False):
+        batch = batch.to(device)
+        yhat_all.extend(final_model(batch).cpu().numpy().ravel().tolist())
+        age_all.extend(batch.y.cpu().numpy().ravel().tolist())
+
+yhat_all = np.array(yhat_all, dtype=float)
+age_all  = np.array(age_all,  dtype=float)
+mask_all = np.isfinite(yhat_all) & np.isfinite(age_all)
+
+if mask_all.sum() >= 3:
+    bias_reg_all = LinearRegression().fit(age_all[mask_all].reshape(-1,1), yhat_all[mask_all])
+    a_all, b_all = float(bias_reg_all.intercept_), float(bias_reg_all.coef_[0])
+else:
+    a_all, b_all = 0.0, 1.0
+
+bias_json = os.path.join(OUTDIR_RES, "bias_correction_all_healthy.json")
+with open(bias_json, "w") as f:
+    json.dump({"a": a_all, "b": b_all}, f, indent=2)
+print(f"[OK] Saved bias params on all healthy to: {bias_json}")
