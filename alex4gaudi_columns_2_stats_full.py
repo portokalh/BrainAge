@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Wed Oct 29 17:20:05 2025
-
-@author: alex
-"""
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-GAUDI FULL ANALYSIS PIPELINE
+GAUDI FULL ANALYSIS PIPELINE (DATE-STAMPED + CATEGORICAL TRAIT FIX)
 
 Performs:
 - UMAP embeddings with clusters (colored by trait)
@@ -17,9 +9,10 @@ Performs:
 - Violin/boxplots per trait
 - Regression of latent embeddings vs age
 - Summary heatmaps: –log10(p), |β|, and R²
+- Saves all outputs in Graph_data/results_<YYYY-MM-DD>/
 
 Author: Alexandra Badea (with ChatGPT)
-Date: Oct 30, 2025
+Date: 2025-10-29
 """
 
 import os
@@ -30,9 +23,14 @@ import matplotlib.pyplot as plt
 from scipy import stats
 import statsmodels.api as sm
 import umap
+from datetime import date
 
 # ---------------- CONFIG ----------------
 BASE = "/mnt/newStor/paros/paros_WORK/alex/alex4gaudi/GAUDI-implementation/Graph_data"
+TODAY = date.today().strftime("%Y-%m-%d")
+OUTROOT = os.path.join(BASE, f"results_{TODAY}")
+os.makedirs(OUTROOT, exist_ok=True)
+
 MODALITIES = ["MD", "QSM", "joint"]
 TRAITS = ["age", "APOE", "sex", "risk_for_ad"]
 SEED = 42
@@ -53,7 +51,7 @@ def load_data(mod):
 
 
 def safe_stats(df, cluster_col, trait):
-    """Appropriate test by data type."""
+    """Automatically select Chi2 for categorical or ANOVA/Kruskal for continuous."""
     if df[trait].dtype == object or df[trait].nunique() <= 6:
         tab = pd.crosstab(df[cluster_col], df[trait])
         chi2, p, dof, _ = stats.chi2_contingency(tab)
@@ -78,12 +76,25 @@ def regression_age(df, zcol="z1"):
     return beta, r2, pval
 
 
-def umap_plot(emb, clusters, trait_values, title, outpath):
+def umap_plot(emb, trait_values, title, outpath, categorical=False):
+    """UMAP scatter colored by trait."""
     reducer = umap.UMAP(n_neighbors=10, min_dist=0.3, random_state=SEED)
     proj = reducer.fit_transform(emb)
+
     plt.figure(figsize=(6, 5))
-    sc = plt.scatter(proj[:, 0], proj[:, 1], c=trait_values, cmap="viridis", s=60, alpha=0.8)
-    plt.colorbar(sc, label=title)
+    if categorical:
+        unique_vals = pd.unique(trait_values)
+        palette = sns.color_palette("Set2", len(unique_vals))
+        for i, val in enumerate(unique_vals):
+            mask = np.array(trait_values) == val
+            plt.scatter(proj[mask, 0], proj[mask, 1],
+                        s=70, alpha=0.8, label=str(val), color=palette[i])
+        plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left", title=title)
+    else:
+        sc = plt.scatter(proj[:, 0], proj[:, 1],
+                         c=trait_values, cmap="viridis", s=60, alpha=0.8)
+        plt.colorbar(sc, label=title)
+
     plt.title(title)
     plt.tight_layout()
     plt.savefig(outpath, dpi=300, bbox_inches="tight")
@@ -104,7 +115,7 @@ for mod in MODALITIES:
     )
 
     cluster_col = [c for c in df.columns if "cluster" in c.lower()][0]
-    outdir = os.path.join(BASE, f"latent_epochs_{mod}")
+    outdir = os.path.join(OUTROOT, f"{mod}")
     os.makedirs(outdir, exist_ok=True)
 
     # ---------- Cluster-trait visualization ----------
@@ -113,13 +124,15 @@ for mod in MODALITIES:
             print(f"⚠️ Missing {trait} in {mod}")
             continue
 
-        # UMAP embedding colored by trait
-        trait_vals = pd.to_numeric(df[trait], errors="coerce")
-        umap_file = os.path.join(outdir, f"{mod}_embedding_by_{trait}_with_clusters.png")
-        umap_plot(emb, df[cluster_col], trait_vals, f"{mod.upper()} Embedding colored by {trait}", umap_file)
-        print(f"Saved → {umap_file} (legend outside)")
+        trait_vals = df[trait]
+        is_cat = (trait in ["APOE", "sex"]) or (trait_vals.dtype == object) or (df[trait].nunique() < 6)
 
-        # Violin/boxplot per cluster
+        umap_file = os.path.join(outdir, f"{mod}_embedding_by_{trait}_with_clusters.png")
+        umap_plot(emb, np.array(trait_vals), f"{mod.upper()} Embedding colored by {trait}",
+                  umap_file, categorical=is_cat)
+        print(f"Saved → {umap_file}")
+
+        # Violin/boxplot
         statres = safe_stats(df, cluster_col, trait)
         p = statres["p"]
         plt.figure(figsize=(5, 4))
@@ -149,39 +162,39 @@ for mod in MODALITIES:
 cluster_df = pd.DataFrame(all_cluster_stats)
 reg_df = pd.DataFrame(regression_results)
 
-cluster_df.to_csv(os.path.join(BASE, "cluster_trait_associations_full.csv"), index=False)
-reg_df.to_csv(os.path.join(BASE, "embedding_vs_age_full.csv"), index=False)
-print("\n✅ Saved CSVs: cluster_trait_associations_full.csv, embedding_vs_age_full.csv")
-
+cluster_csv = os.path.join(OUTROOT, "cluster_trait_associations_full.csv")
+reg_csv = os.path.join(OUTROOT, "embedding_vs_age_full.csv")
+cluster_df.to_csv(cluster_csv, index=False)
+reg_df.to_csv(reg_csv, index=False)
+print(f"\n✅ Saved CSVs → {OUTROOT}/")
 
 # ---------------- HEATMAPS ----------------
-# 1. –log₁₀(p) for cluster–trait tests
+# 1. –log₁₀(p)
 heatmap_df = cluster_df.pivot(index="trait", columns="modality", values="p")
 heatmap_df = -np.log10(heatmap_df)
-heatmap_df = heatmap_df.replace([np.inf, -np.inf], np.nan)
 plt.figure(figsize=(6, 4))
 sns.heatmap(heatmap_df, annot=True, fmt=".2f", cmap="mako", cbar_kws={"label": "–log₁₀(p)"})
 plt.title("Cluster–Trait Association Strength (–log₁₀ p)")
 plt.tight_layout()
-plt.savefig(os.path.join(BASE, "cluster_trait_p_heatmap.png"), dpi=300, bbox_inches="tight")
+plt.savefig(os.path.join(OUTROOT, "cluster_trait_p_heatmap.png"), dpi=300, bbox_inches="tight")
 plt.close()
 
-# 2. |β| across latent dims × modalities
+# 2. |β|
 beta_matrix = reg_df.pivot(index="dimension", columns="modality", values="abs_beta")
 plt.figure(figsize=(7, 6))
 sns.heatmap(beta_matrix, cmap="rocket_r", cbar_kws={"label": "|β| (effect of age)"})
 plt.title("Absolute β per Latent Dimension (Age Regression)")
 plt.tight_layout()
-plt.savefig(os.path.join(BASE, "latent_age_absbeta_heatmap.png"), dpi=300, bbox_inches="tight")
+plt.savefig(os.path.join(OUTROOT, "latent_age_absbeta_heatmap.png"), dpi=300, bbox_inches="tight")
 plt.close()
 
-# 3. R² across latent dims × modalities
+# 3. R²
 r2_matrix = reg_df.pivot(index="dimension", columns="modality", values="R2")
 plt.figure(figsize=(7, 6))
 sns.heatmap(r2_matrix, cmap="viridis", cbar_kws={"label": "R² (variance explained by age)"})
 plt.title("R² per Latent Dimension (Age Regression)")
 plt.tight_layout()
-plt.savefig(os.path.join(BASE, "latent_age_R2_heatmap.png"), dpi=300, bbox_inches="tight")
+plt.savefig(os.path.join(OUTROOT, "latent_age_R2_heatmap.png"), dpi=300, bbox_inches="tight")
 plt.close()
 
-print("✅ All heatmaps saved → cluster_trait_p_heatmap.png, latent_age_absbeta_heatmap.png, latent_age_R2_heatmap.png")
+print(f"✅ All figures and CSVs saved in {OUTROOT}")
